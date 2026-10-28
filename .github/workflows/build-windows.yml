@@ -1,0 +1,114 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to attach the installer to a GitHub Release on tags
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      # Code signing is used only when these repository secrets are set
+      # (Azure Artifact Signing, formerly Trusted Signing). See README.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+          New-Item -ItemType Directory -Force ffmpeg | Out-Null
+          Get-ChildItem ffmpeg_tmp -Recurse -Include ffmpeg.exe,ffprobe.exe | Copy-Item -Destination ffmpeg
+          Remove-Item ffmpeg.zip; Remove-Item ffmpeg_tmp -Recurse -Force
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path noise_remover\__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build app with PyInstaller
+        run: >
+          pyinstaller --noconfirm --clean --windowed --name NoiseRemover
+          --icon installer\app.ico
+          --add-binary "ffmpeg\ffmpeg.exe;ffmpeg"
+          --add-binary "ffmpeg\ffprobe.exe;ffmpeg"
+          --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets
+          --exclude-module PySide6.Qt3DCore --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml
+          --exclude-module PySide6.QtMultimedia --exclude-module PySide6.QtPdf --exclude-module tkinter
+          main.py
+
+      - name: Smoke test (ffmpeg found, engine runs)
+        shell: pwsh
+        run: |
+          dist\NoiseRemover\_internal\ffmpeg\ffmpeg.exe -v error -f lavfi -i "anoisesrc=d=5:a=0.1" -ac 2 test_in.wav
+          python -m noise_remover.cli test_in.wav test_out.wav
+          if (!(Test-Path test_out.wav)) { throw "no output" }
+
+      - name: Sign app files
+        if: env.AZURE_CLIENT_ID != ''
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist\NoiseRemover
+          files-folder-filter: exe,dll,pyd
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          if (!(Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.ver.outputs.version }}" installer\NoiseRemover.iss
+
+      - name: Sign installer
+        if: env.AZURE_CLIENT_ID != ''
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\NoiseRemover-Setup-${{ steps.ver.outputs.version }}.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NoiseRemover-Setup-${{ steps.ver.outputs.version }}
+          path: dist/NoiseRemover-Setup-*.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/NoiseRemover-Setup-*.exe
